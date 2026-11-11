@@ -1,0 +1,18 @@
+services:
+  discord-hr:
+    build: .
+    image: discord-hr:local
+    container_name: discord-hr
+    restart: unless-stopped
+    shm_size: 1gb
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - CUSTOM_USER=maan
+      - PASSWORD=${WEB_PASSWORD}
+    volumes:
+      - ./data:/config
+      - ./config.env:/config/.config/hr-rpc/config.env:ro
+    ports:
+      - "3011:3001"   # web desktop (https) — log in to Discord here once
