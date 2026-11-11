@@ -4,7 +4,7 @@
 Runs on the same Linux machine as the Discord desktop app. Python 3 stdlib only.
 Config: ~/.config/health-display/config.env (KEY=VALUE), overridable by environment vars.
 """
-import json, os, socket, struct, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+import json, os, re, socket, struct, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 
 CONFIG_PATH = os.path.expanduser(os.environ.get("HEALTH_DISPLAY_CONFIG", "~/.config/health-display/config.env"))
 
@@ -12,8 +12,11 @@ def load_config():
     cfg = {
         "PULSOID_TOKEN": "", "DISCORD_APP_ID": "",
         "DETAILS": "❤️ {bpm} bpm", "STATE": "min {min} · avg {avg} · max {max}",
-        "IMAGE": "on", "IMG_TEXT": "{bpm}", "IMG_BG": "ED4245", "IMG_FG": "FFFFFF",
+        "IMAGE": "on", "IMG_TEXT": "{bpm}", "IMG_HOVER": "{bpm} bpm", "IMG_BG": "ED4245", "IMG_FG": "FFFFFF",
         "POLL_INTERVAL": "3", "UPDATE_INTERVAL": "15", "STALE_AFTER": "60",
+        "GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "", "GOOGLE_INTERVAL": "300",
+        "STAT_MAX_AGE_DAYS": "1.5", "ROLLUP_SOURCES": "google-wearables",
+        "SOURCE_DEFAULT": "watch,oura,ultrahuman,any",
     }
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -65,10 +68,10 @@ class HeartRate:
     def live(self):
         return self.bpm is not None and time.time() - self.measured <= STALE
 
-    def fill(self, tpl):
-        avg = round(self.total / self.n) if self.n else "?"
-        return (tpl.replace("{bpm}", str(self.bpm or "?")).replace("{min}", str(self.mn or "?"))
-                   .replace("{max}", str(self.mx or "?")).replace("{avg}", str(avg)))
+    def values(self):
+        v = {"bpm": self.bpm, "min": self.mn, "max": self.mx,
+             "avg": round(self.total / self.n) if self.n else None}
+        return {k: str(x) for k, x in v.items() if x is not None}
 
 # ------------------------------------------------------------------ Google Health API
 GOOGLE_API = "https://health.googleapis.com/v4/users/me"
@@ -182,6 +185,151 @@ def cmd_auth(args):
     scopes = GoogleHealth.exchange(code)
     print(f"Signed in. Token saved to {GOOGLE_TOKEN_PATH}\nGranted: {scopes}")
 
+SOURCE_MATCH = {
+    "watch": lambda ds: ds.get("platform") == "FITBIT",
+    "oura": lambda ds: (ds.get("application") or {}).get("packageName") == "com.ouraring.oura",
+    "ultrahuman": lambda ds: (ds.get("application") or {}).get("packageName") == "com.ultrahuman.android",
+    "any": lambda ds: True,
+}
+
+def hm(minutes):
+    minutes = int(round(float(minutes)))
+    return f"{minutes // 60}h{minutes % 60:02d}" if minutes >= 60 else f"{minutes}m"
+
+class HealthStats:
+    """Daily stats from the Google Health API, refreshed in a background thread.
+
+    `values` maps placeholder name -> display string; missing/stale stats are simply absent.
+    """
+    def __init__(self):
+        self.g = GoogleHealth(); self.values = {}
+        self.max_age = float(C["STAT_MAX_AGE_DAYS"])
+        self.family = f"users/me/dataSourceFamilies/{C['ROLLUP_SOURCES']}"
+
+    def prefs(self, group):
+        return [s.strip() for s in (C.get(f"SOURCE_{group}") or C["SOURCE_DEFAULT"]).split(",") if s.strip()]
+
+    def pick(self, points, group, key):
+        """Newest point from the first preferred source that has one."""
+        for src in self.prefs(group):
+            match = [p for p in points if SOURCE_MATCH.get(src, lambda ds: False)(p.get("dataSource", {}))]
+            if match:
+                return max(match, key=key)
+        return None
+
+    def list(self, dtype, flt, size=100):
+        return self.g.get(f"dataTypes/{dtype}/dataPoints", {"filter": flt, "pageSize": size}).get("dataPoints", [])
+
+    def rollup_today(self, dtype):
+        t = time.localtime(); n = time.localtime(time.time() + 86400)
+        r = self.g.post(f"dataTypes/{dtype}/dataPoints:dailyRollUp", {
+            "range": {"start": {"date": {"year": t.tm_year, "month": t.tm_mon, "day": t.tm_mday}},
+                      "end": {"date": {"year": n.tm_year, "month": n.tm_mon, "day": n.tm_mday}}},
+            "windowSizeDays": 1, "dataSourceFamily": self.family})
+        for p in r.get("rollupDataPoints", []):
+            d = p["civilStartTime"]["date"]
+            if (d["year"], d["month"], d["day"]) == (t.tm_year, t.tm_mon, t.tm_mday):
+                return p
+        return None
+
+    @staticmethod
+    def since(days, civil=False):
+        ts = time.time() - days * 86400
+        return time.strftime("%Y-%m-%dT%H:%M:%S" if civil else "%Y-%m-%dT%H:%M:%SZ",
+                             time.localtime(ts) if civil else time.gmtime(ts))
+
+    def daily(self, dtype, group, days=None):
+        d = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days or self.max_age) * 86400))
+        body = dtype.replace("-", "_")
+        camel = "".join(w.capitalize() if i else w for i, w in enumerate(dtype.split("-")))
+        p = self.pick(self.list(dtype, f'{body}.date >= "{d}"'), group,
+                      lambda p: tuple(p[camel]["date"][k] for k in ("year", "month", "day")))
+        return p[camel] if p else None
+
+    def refresh(self):
+        v = {}
+        def step(name, fn):
+            try:
+                fn()
+            except Exception as e:
+                log(f"google: {name}: {e}")
+        # --- today's totals
+        def today():
+            if (p := self.rollup_today("steps")): v["steps"] = f"{int(p['steps']['countSum']):,}"
+            if (p := self.rollup_today("distance")): v["distance"] = f"{int(p['distance']['millimetersSum']) / 1e6:.1f}"
+            if (p := self.rollup_today("total-calories")): v["calories"] = f"{round(p['totalCalories']['kcalSum']):,}"
+            if (p := self.rollup_today("active-minutes")):
+                lv = {x["activityLevel"]: int(x["activeMinutesSum"]) for x in p["activeMinutes"]["activeMinutesRollupByActivityLevel"]}
+                v["active"] = str(sum(lv.values())); v["active_mv"] = str(lv.get("MODERATE", 0) + lv.get("VIGOROUS", 0))
+            if (p := self.rollup_today("floors")) and "floors" in p:
+                v["floors"] = str(next(iter(p["floors"].values())))
+        step("today", today)
+        def azm():
+            pts = self.list("active-zone-minutes", f'active_zone_minutes.interval.civil_start_time >= "{time.strftime("%Y-%m-%dT00:00:00")}"', 1000)
+            v["azm"] = str(sum(int(p["activeZoneMinutes"]["activeZoneMinutes"]) for p in pts))
+        step("azm", azm)
+        # --- latest daily/overnight metrics
+        def overnight():
+            if (d := self.daily("daily-resting-heart-rate", "RHR")): v["rhr"] = str(d["beatsPerMinute"])
+            if (d := self.daily("daily-heart-rate-variability", "HRV")): v["hrv"] = str(round(d["averageHeartRateVariabilityMilliseconds"]))
+            if (d := self.daily("daily-oxygen-saturation", "SPO2")): v["spo2"] = f"{d['averagePercentage']:.0f}"
+            if (d := self.daily("daily-respiratory-rate", "RESP")): v["resp"] = f"{d['breathsPerMinute']:.1f}"
+            if (d := self.daily("daily-sleep-temperature-derivations", "TEMP")):
+                v["temp_delta"] = f"{d['nightlyTemperatureCelsius'] - d['baselineTemperatureCelsius']:+.1f}"
+            if (d := self.daily("daily-vo2-max", "VO2", days=30)):
+                v["vo2max"] = f"{d['vo2Max']:.0f}"; v["fitness"] = d.get("cardioFitnessLevel", "").replace("_", " ").title()
+        step("overnight", overnight)
+        def sleep():
+            pts = self.list("sleep", f'sleep.interval.end_time >= "{self.since(self.max_age)}"', 25)
+            p = self.pick(pts, "SLEEP", lambda p: p["sleep"]["interval"]["endTime"])
+            if not p:
+                return
+            s = p["sleep"]["summary"]; st = {x["type"]: int(x["minutes"]) for x in s.get("stagesSummary", [])}
+            asleep = int(s["minutesAsleep"]); period = int(s.get("minutesInSleepPeriod") or 0)
+            v["sleep"] = hm(asleep)
+            if period: v["sleep_eff"] = str(round(100 * asleep / period))
+            for k in ("DEEP", "REM", "LIGHT", "AWAKE"):
+                if k in st: v[k.lower()] = hm(st[k])
+        step("sleep", sleep)
+        # --- other records
+        def other():
+            pts = self.list("exercise", f'exercise.interval.civil_start_time >= "{self.since(1, civil=True)}"', 25)
+            if pts:
+                e = max(pts, key=lambda p: p["exercise"]["interval"]["startTime"])["exercise"]
+                v["workout"] = e.get("displayName") or e.get("exerciseType", "").title()
+                if e.get("activeDuration"): v["workout_time"] = hm(float(e["activeDuration"].rstrip("s")) / 60)
+            pts = self.list("weight", f'weight.sample_time.physical_time >= "{self.since(30)}"', 50)
+            if pts:
+                w = max(pts, key=lambda p: p["weight"]["sampleTime"]["physicalTime"])["weight"]
+                v["weight"] = f"{w['weightGrams'] / 1000:.1f}"
+            pts = self.list("nutrition-log", f'nutrition_log.interval.civil_start_time >= "{time.strftime("%Y-%m-%dT00:00:00")}"', 500)
+            if pts:
+                v["kcal_in"] = f"{round(sum(p['nutritionLog'].get('energy', {}).get('kcal', 0) for p in pts)):,}"
+            pts = self.list("blood-glucose", f'blood_glucose.sample_time.physical_time >= "{self.since(1)}"', 50)
+            if pts:
+                bg = max(pts, key=lambda p: p["bloodGlucose"]["sampleTime"]["physicalTime"])["bloodGlucose"]
+                mg = bg["bloodGlucoseMilligramsPerDeciliter"]
+                v["glucose"] = f"{mg / 18.016:.1f}"; v["glucose_mgdl"] = f"{mg:.0f}"
+            pts = self.list("electrocardiogram", f'electrocardiogram.interval.start_time >= "{self.since(1)}"', 10)
+            if pts:
+                e = max(pts, key=lambda p: p["electrocardiogram"]["interval"]["startTime"])["electrocardiogram"]
+                v["ecg"] = e.get("resultClassification", "").replace("_", " ").capitalize()
+        step("other", other)
+        self.values = v
+        log("google: " + (", ".join(f"{k}={x}" for k, x in sorted(v.items())) or "no stats"))
+
+    def run_forever(self):
+        while True:
+            try:
+                self.refresh()
+            except Exception as e:
+                log(f"google: {e}")
+            time.sleep(float(C["GOOGLE_INTERVAL"]))
+
+def cmd_stats(args):
+    """Fetch and print the display values once."""
+    HealthStats().refresh()
+
 PROBE_TYPES = [
     "steps", "active-minutes", "active-zone-minutes", "activity-level", "active-energy-burned",
     "total-calories", "distance", "floors", "altitude", "sedentary-period", "exercise",
@@ -280,20 +428,40 @@ def tile_url(bpm):
     text = urllib.parse.quote(C["IMG_TEXT"].replace("{bpm}", str(bpm)))
     return f"https://placehold.co/512x512/{C['IMG_BG']}/{C['IMG_FG']}/png?text={text}&font=montserrat"
 
-def build_activity(hr, started):
+def render(tpl, values):
+    """Fill {placeholders}; drop any ' · '-separated segment that references a missing value."""
+    out = []
+    for seg in tpl.split(" · "):
+        names = re.findall(r"\{(\w+)\}", seg)
+        if all(n in values for n in names):
+            out.append(re.sub(r"\{(\w+)\}", lambda m: values[m.group(1)], seg))
+    text = " · ".join(x for x in out if x.strip())
+    return text[:128] if len(text) >= 2 else ""
+
+def build_activity(hr, stats, started):
     if not hr.live:
         return None
-    a = {"type": 0, "details": hr.fill(C["DETAILS"]), "timestamps": {"start": int(started)}}
-    if C["STATE"]:
-        a["state"] = hr.fill(C["STATE"])
+    values = {**(stats.values if stats else {}), **hr.values()}
+    a = {"type": 0, "timestamps": {"start": int(started)}}
+    if (details := render(C["DETAILS"], values)):
+        a["details"] = details
+    if (state := render(C["STATE"], values)):
+        a["state"] = state
     if C["IMAGE"].lower() != "off":
-        a["assets"] = {"large_image": tile_url(hr.bpm), "large_text": f"{hr.bpm} bpm"}
+        a["assets"] = {"large_image": tile_url(hr.bpm)}
+        if (hover := render(C["IMG_HOVER"], values)):
+            a["assets"]["large_text"] = hover
     return a
 
 def main():
     if not C["PULSOID_TOKEN"] or not C["DISCORD_APP_ID"]:
         sys.exit(f"Set PULSOID_TOKEN and DISCORD_APP_ID in {CONFIG_PATH}")
-    hr = HeartRate(); ipc = DiscordIPC(C["DISCORD_APP_ID"])
+    hr = HeartRate(); ipc = DiscordIPC(C["DISCORD_APP_ID"]); stats = None
+    if GoogleHealth.configured() and os.path.exists(GOOGLE_TOKEN_PATH):
+        import threading
+        stats = HealthStats(); threading.Thread(target=stats.run_forever, daemon=True).start()
+    elif GoogleHealth.configured():
+        log(f"google: not signed in ({GOOGLE_TOKEN_PATH} missing); run: health-display auth")
     started = time.time(); last_key = "init"; last_push = 0; next_poll = 0; warned = False
     while True:
         now = time.time()
@@ -309,12 +477,12 @@ def main():
                     log("discord: desktop app not found, retrying every 15s"); warned = True
                 time.sleep(15); continue
             warned = False; last_key = "init"
-        act = build_activity(hr, started)
+        act = build_activity(hr, stats, started)
         key = json.dumps({k: v for k, v in (act or {}).items() if k != "timestamps"}, sort_keys=True)
         if key != last_key and (now - last_push >= UPDATE or last_key == "init" or act is None):
             try:
                 ipc.set_activity(act)
-                log(f"presence: {act['details']}" if act else "presence: cleared (no HR data)")
+                log(f"presence: {act.get('details', '')} | {act.get('state', '')}" if act else "presence: cleared (no HR data)")
                 last_key = key; last_push = now
             except (OSError, ConnectionError) as e:
                 log(f"discord: {e}"); ipc.close(); continue
@@ -323,7 +491,7 @@ def main():
 if __name__ == "__main__":
     cmd, rest = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("run", [])
     try:
-        {"run": lambda a: main(), "auth": cmd_auth, "probe": cmd_probe}.get(
-            cmd, lambda a: sys.exit("usage: health-display [run | auth [redirect-url] | probe [type...]]"))(rest)
+        {"run": lambda a: main(), "auth": cmd_auth, "stats": cmd_stats, "probe": cmd_probe}.get(
+            cmd, lambda a: sys.exit("usage: health-display [run | auth [redirect-url] | stats | probe [type...]]"))(rest)
     except KeyboardInterrupt:
         pass
