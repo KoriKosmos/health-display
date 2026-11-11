@@ -1,4 +1,4 @@
-# hr-rpc
+# Health Display
 
 Pulsoid heart rate → Discord Rich Presence, using Discord's official local RPC
 socket (no user token, no selfbot). Python 3 standard library only.

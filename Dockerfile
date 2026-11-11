@@ -1,6 +1,6 @@
 FROM lscr.io/linuxserver/baseimage-selkies:debiantrixie
 
-ENV TITLE="Discord HR"
+ENV TITLE="Health Display"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3 curl ca-certificates && \

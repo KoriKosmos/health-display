@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pulsoid heart rate -> Discord Rich Presence (official local IPC, no user token).
+"""Health Display: Pulsoid heart rate -> Discord Rich Presence (official local IPC, no user token).
 
 Runs on the same Linux machine as the Discord desktop app. Python 3 stdlib only.
 Config: ~/.config/hr-rpc/config.env (KEY=VALUE), overridable by environment vars.
@@ -47,7 +47,7 @@ class HeartRate:
     def poll(self):
         req = urllib.request.Request(
             "https://dev.pulsoid.net/api/v1/data/heart_rate/latest",
-            headers={"Authorization": f"Bearer {C['PULSOID_TOKEN']}", "User-Agent": "hr-rpc"})
+            headers={"Authorization": f"Bearer {C['PULSOID_TOKEN']}", "User-Agent": "Health-Display"})
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 d = json.load(r)

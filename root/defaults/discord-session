@@ -1,5 +1,5 @@
 #!/bin/sh
-# Launched by the desktop session (autostart). Runs hr-rpc next to Discord and
+# Launched by the desktop session (autostart). Runs Health Display (hr-rpc) next to Discord and
 # relaunches Discord if it hangs on the "Starting..." splash or exits.
 mkdir -p "$HOME/.config/discord"
 # Discord refuses to start when the installed .deb is outdated; skip that check.

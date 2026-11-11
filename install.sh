@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs hr-rpc as a systemd user service that starts with your desktop session.
+# Installs Health Display as a systemd user service (hr-rpc) that starts with your desktop session.
 set -e
 here="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p ~/.local/bin ~/.config/hr-rpc ~/.config/systemd/user
@@ -10,7 +10,7 @@ if [ ! -f ~/.config/hr-rpc/config.env ]; then
 fi
 cat > ~/.config/systemd/user/hr-rpc.service <<'EOF'
 [Unit]
-Description=Pulsoid heart rate -> Discord Rich Presence
+Description=Health Display (Pulsoid heart rate -> Discord Rich Presence)
 After=graphical-session.target
 PartOf=graphical-session.target
 
