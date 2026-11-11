@@ -16,7 +16,7 @@ def load_config():
         "POLL_INTERVAL": "3", "UPDATE_INTERVAL": "15", "STALE_AFTER": "60",
         "GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "", "GOOGLE_INTERVAL": "300",
         "STAT_MAX_AGE_DAYS": "1.5", "ROLLUP_SOURCES": "google-wearables",
-        "SOURCE_DEFAULT": "watch,oura,ultrahuman,any",
+        "SOURCE_DEFAULT": "watch,oura,ultrahuman,*,samsung,phone",
     }
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -185,40 +185,63 @@ def cmd_auth(args):
     scopes = GoogleHealth.exchange(code)
     print(f"Signed in. Token saved to {GOOGLE_TOKEN_PATH}\nGranted: {scopes}")
 
-SOURCE_MATCH = {
-    "watch": lambda ds: ds.get("platform") == "FITBIT",
-    "oura": lambda ds: (ds.get("application") or {}).get("packageName") == "com.ouraring.oura",
-    "ultrahuman": lambda ds: (ds.get("application") or {}).get("packageName") == "com.ultrahuman.android",
-    "any": lambda ds: True,
+# Health Connect apps with a short name; any other app is identified by its package name.
+APP_ALIASES = {
+    "com.ouraring.oura": "oura", "com.ultrahuman.android": "ultrahuman",
+    "com.sec.android.app.shealth": "samsung", "com.google.android.apps.fitness": "phone",
+    "com.android.healthconnect.phone": "phone",
 }
+
+def source_name(ds):
+    """Short name for the device/app a data point came from (watch, oura, phone, <package>...)."""
+    if ds.get("platform") == "FITBIT":
+        return "phone" if (ds.get("device") or {}).get("displayName") == "MobileTrack" else "watch"
+    pkg = (ds.get("application") or {}).get("packageName")
+    return APP_ALIASES.get(pkg, pkg or (ds.get("platform") or "unknown").lower())
 
 def hm(minutes):
     minutes = int(round(float(minutes)))
     return f"{minutes // 60}h{minutes % 60:02d}" if minutes >= 60 else f"{minutes}m"
 
+def body_of(p):
+    return next(v for k, v in p.items() if k not in ("dataSource", "name"))
+
 class HealthStats:
     """Daily stats from the Google Health API, refreshed in a background thread.
 
-    `values` maps placeholder name -> display string; missing/stale stats are simply absent.
+    Every device/app is a fallback for the others: today's totals come from whichever
+    source counted the most, overnight stats from the most recent night any source
+    recorded (SOURCE_* order breaks ties). `values` maps placeholder -> display string;
+    missing or stale stats are simply absent.
     """
     def __init__(self):
         self.g = GoogleHealth(); self.values = {}
         self.max_age = float(C["STAT_MAX_AGE_DAYS"])
         self.family = f"users/me/dataSourceFamilies/{C['ROLLUP_SOURCES']}"
 
-    def prefs(self, group):
-        return [s.strip() for s in (C.get(f"SOURCE_{group}") or C["SOURCE_DEFAULT"]).split(",") if s.strip()]
+    def rank(self, group, src):
+        """Position of a source in the preference list; '*' stands for any unlisted source."""
+        order = [x.strip() for x in (C.get(f"SOURCE_{group}") or C["SOURCE_DEFAULT"]).split(",") if x.strip()]
+        if src in order:
+            return order.index(src)
+        return order.index("*") if "*" in order else len(order)
 
-    def pick(self, points, group, key):
-        """Newest point from the first preferred source that has one."""
-        for src in self.prefs(group):
-            match = [p for p in points if SOURCE_MATCH.get(src, lambda ds: False)(p.get("dataSource", {}))]
-            if match:
-                return max(match, key=key)
-        return None
+    def best(self, points, group, recency, window=0):
+        """Most recent point; points within `window` of it compete on source preference."""
+        if not points:
+            return None
+        newest = max(recency(p) for p in points)
+        close = [p for p in points if newest - recency(p) <= window]
+        return min(close, key=lambda p: (self.rank(group, source_name(p.get("dataSource", {}))), -recency(p)))
 
-    def list(self, dtype, flt, size=100):
-        return self.g.get(f"dataTypes/{dtype}/dataPoints", {"filter": flt, "pageSize": size}).get("dataPoints", [])
+    def list(self, dtype, flt, size=10000):
+        out, token = [], None
+        for _ in range(20):
+            d = self.g.get(f"dataTypes/{dtype}/dataPoints", {"filter": flt, "pageSize": size, **({"pageToken": token} if token else {})})
+            out += d.get("dataPoints", []); token = d.get("nextPageToken")
+            if not token:
+                return out
+        return out
 
     def rollup_today(self, dtype):
         t = time.localtime(); n = time.localtime(time.time() + 86400)
@@ -232,6 +255,25 @@ class HealthStats:
                 return p
         return None
 
+    def today_by_source(self, dtype, value):
+        """Today's total per data feed: {(name, platform, package, device): total}."""
+        body = dtype.replace("-", "_")
+        totals = {}  # keyed per feed, so e.g. two phone apps counting the same steps aren't added up
+        for p in self.list(dtype, f'{body}.interval.civil_start_time >= "{time.strftime("%Y-%m-%dT00:00:00")}"'):
+            ds = p.get("dataSource", {})
+            feed = (source_name(ds), ds.get("platform"), (ds.get("application") or {}).get("packageName"),
+                    (ds.get("device") or {}).get("displayName"))
+            totals[feed] = totals.get(feed, 0) + value(body_of(p))
+        return totals
+
+    def pick_total(self, group, totals):
+        """Source that counted the most today (the device actually worn); ties -> preference."""
+        totals = {k: x for k, x in totals.items() if x > 0}
+        if not totals:
+            return None, None
+        feed = min(totals, key=lambda k: (-totals[k], self.rank(group, k[0])))
+        return feed[0], totals[feed]
+
     @staticmethod
     def since(days, civil=False):
         ts = time.time() - days * 86400
@@ -239,12 +281,13 @@ class HealthStats:
                              time.localtime(ts) if civil else time.gmtime(ts))
 
     def daily(self, dtype, group, days=None):
+        """Most recent daily record from any source; same-day records -> preference. Returns (body, source)."""
         d = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days or self.max_age) * 86400))
         body = dtype.replace("-", "_")
-        camel = "".join(w.capitalize() if i else w for i, w in enumerate(dtype.split("-")))
-        p = self.pick(self.list(dtype, f'{body}.date >= "{d}"'), group,
-                      lambda p: tuple(p[camel]["date"][k] for k in ("year", "month", "day")))
-        return p[camel] if p else None
+        def day(p):
+            x = body_of(p)["date"]; return time.mktime((x["year"], x["month"], x["day"], 0, 0, 0, 0, 0, -1))
+        p = self.best(self.list(dtype, f'{body}.date >= "{d}"'), group, day)
+        return (body_of(p), source_name(p.get("dataSource", {}))) if p else (None, None)
 
     def refresh(self):
         v = {}
@@ -253,40 +296,53 @@ class HealthStats:
                 fn()
             except Exception as e:
                 log(f"google: {name}: {e}")
-        # --- today's totals
+        # --- today's totals: the source with the highest count wins (no double counting)
         def today():
-            if (p := self.rollup_today("steps")): v["steps"] = f"{int(p['steps']['countSum']):,}"
-            if (p := self.rollup_today("distance")): v["distance"] = f"{int(p['distance']['millimetersSum']) / 1e6:.1f}"
+            src, n = self.pick_total("STEPS", self.today_by_source("steps", lambda b: int(b["count"])))
+            if src: v["steps"] = f"{n:,}"; v["steps_src"] = src
+            src, n = self.pick_total("DISTANCE", self.today_by_source("distance", lambda b: int(b["millimeters"])))
+            if src: v["distance"] = f"{n / 1e6:.1f}"
+            src, n = self.pick_total("ACTIVE", self.today_by_source(
+                "active-minutes", lambda b: sum(int(x["activeMinutes"]) for x in b["activeMinutesByActivityLevel"])))
+            if src: v["active"] = str(n)
+            src, n = self.pick_total("ACTIVE", self.today_by_source(
+                "active-minutes", lambda b: sum(int(x["activeMinutes"]) for x in b["activeMinutesByActivityLevel"]
+                                                if x["activityLevel"] in ("MODERATE", "VIGOROUS"))))
+            v["active_mv"] = str(n or 0)
+            src, n = self.pick_total("CALORIES", self.today_by_source("active-energy-burned", lambda b: b.get("kcal", 0)))
+            if src: v["active_kcal"] = f"{round(n):,}"
+            src, n = self.pick_total("AZM", self.today_by_source("active-zone-minutes", lambda b: int(b["activeZoneMinutes"])))
+            v["azm"] = str(n or 0)
+        step("today", today)
+        def rollups():  # only available as rollups; watch/Google sources
             if (p := self.rollup_today("total-calories")): v["calories"] = f"{round(p['totalCalories']['kcalSum']):,}"
-            if (p := self.rollup_today("active-minutes")):
-                lv = {x["activityLevel"]: int(x["activeMinutesSum"]) for x in p["activeMinutes"]["activeMinutesRollupByActivityLevel"]}
-                v["active"] = str(sum(lv.values())); v["active_mv"] = str(lv.get("MODERATE", 0) + lv.get("VIGOROUS", 0))
             if (p := self.rollup_today("floors")) and "floors" in p:
                 v["floors"] = str(next(iter(p["floors"].values())))
-        step("today", today)
-        def azm():
-            pts = self.list("active-zone-minutes", f'active_zone_minutes.interval.civil_start_time >= "{time.strftime("%Y-%m-%dT00:00:00")}"', 1000)
-            v["azm"] = str(sum(int(p["activeZoneMinutes"]["activeZoneMinutes"]) for p in pts))
-        step("azm", azm)
-        # --- latest daily/overnight metrics
+        step("rollups", rollups)
+        # --- overnight metrics: most recent night from any source
         def overnight():
-            if (d := self.daily("daily-resting-heart-rate", "RHR")): v["rhr"] = str(d["beatsPerMinute"])
-            if (d := self.daily("daily-heart-rate-variability", "HRV")): v["hrv"] = str(round(d["averageHeartRateVariabilityMilliseconds"]))
-            if (d := self.daily("daily-oxygen-saturation", "SPO2")): v["spo2"] = f"{d['averagePercentage']:.0f}"
-            if (d := self.daily("daily-respiratory-rate", "RESP")): v["resp"] = f"{d['breathsPerMinute']:.1f}"
-            if (d := self.daily("daily-sleep-temperature-derivations", "TEMP")):
-                v["temp_delta"] = f"{d['nightlyTemperatureCelsius'] - d['baselineTemperatureCelsius']:+.1f}"
-            if (d := self.daily("daily-vo2-max", "VO2", days=30)):
-                v["vo2max"] = f"{d['vo2Max']:.0f}"; v["fitness"] = d.get("cardioFitnessLevel", "").replace("_", " ").title()
+            d, src = self.daily("daily-resting-heart-rate", "RHR")
+            if d: v["rhr"] = str(d["beatsPerMinute"]); v["rhr_src"] = src
+            d, src = self.daily("daily-heart-rate-variability", "HRV")
+            if d: v["hrv"] = str(round(d["averageHeartRateVariabilityMilliseconds"])); v["hrv_src"] = src
+            d, _ = self.daily("daily-oxygen-saturation", "SPO2")
+            if d: v["spo2"] = f"{d['averagePercentage']:.0f}"
+            d, _ = self.daily("daily-respiratory-rate", "RESP")
+            if d: v["resp"] = f"{d['breathsPerMinute']:.1f}"
+            d, _ = self.daily("daily-sleep-temperature-derivations", "TEMP")
+            if d: v["temp_delta"] = f"{d['nightlyTemperatureCelsius'] - d['baselineTemperatureCelsius']:+.1f}"
+            d, _ = self.daily("daily-vo2-max", "VO2", days=30)
+            if d: v["vo2max"] = f"{d['vo2Max']:.0f}"; v["fitness"] = d.get("cardioFitnessLevel", "").replace("_", " ").title()
         step("overnight", overnight)
         def sleep():
             pts = self.list("sleep", f'sleep.interval.end_time >= "{self.since(self.max_age)}"', 25)
-            p = self.pick(pts, "SLEEP", lambda p: p["sleep"]["interval"]["endTime"])
+            ends = lambda p: time.mktime(time.strptime(p["sleep"]["interval"]["endTime"][:19], "%Y-%m-%dT%H:%M:%S"))
+            p = self.best(pts, "SLEEP", ends, window=4 * 3600)  # sessions ending within 4h = same night
             if not p:
                 return
             s = p["sleep"]["summary"]; st = {x["type"]: int(x["minutes"]) for x in s.get("stagesSummary", [])}
             asleep = int(s["minutesAsleep"]); period = int(s.get("minutesInSleepPeriod") or 0)
-            v["sleep"] = hm(asleep)
+            v["sleep"] = hm(asleep); v["sleep_src"] = source_name(p.get("dataSource", {}))
             if period: v["sleep_eff"] = str(round(100 * asleep / period))
             for k in ("DEEP", "REM", "LIGHT", "AWAKE"):
                 if k in st: v[k.lower()] = hm(st[k])
