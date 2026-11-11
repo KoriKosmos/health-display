@@ -8,6 +8,6 @@ RUN apt-get update && \
     apt-get install -y /tmp/discord.deb && \
     rm -rf /tmp/discord.deb /var/lib/apt/lists/*
 
-COPY hr_rpc.py /usr/local/bin/hr-rpc
+COPY health_display.py /usr/local/bin/health-display
 COPY root/ /
-RUN chmod 755 /usr/local/bin/hr-rpc /defaults/discord-session
+RUN chmod 755 /usr/local/bin/health-display /defaults/discord-session

@@ -2,11 +2,11 @@
 """Health Display: Pulsoid heart rate -> Discord Rich Presence (official local IPC, no user token).
 
 Runs on the same Linux machine as the Discord desktop app. Python 3 stdlib only.
-Config: ~/.config/hr-rpc/config.env (KEY=VALUE), overridable by environment vars.
+Config: ~/.config/health-display/config.env (KEY=VALUE), overridable by environment vars.
 """
 import json, os, socket, struct, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 
-CONFIG_PATH = os.path.expanduser(os.environ.get("HR_RPC_CONFIG", "~/.config/hr-rpc/config.env"))
+CONFIG_PATH = os.path.expanduser(os.environ.get("HEALTH_DISPLAY_CONFIG", "~/.config/health-display/config.env"))
 
 def load_config():
     cfg = {

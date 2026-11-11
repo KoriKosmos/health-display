@@ -13,7 +13,7 @@ socket (no user token, no selfbot). Python 3 standard library only.
 ## Run in a container (headless server)
 
 Runs the official Discord desktop client in a browser-accessible desktop
-(`linuxserver/baseimage-selkies`) with `hr_rpc.py` alongside it.
+(`linuxserver/baseimage-selkies`) with `health_display.py` alongside it.
 
 ```sh
 cp .env.example .env   # set WEB_PASSWORD
@@ -29,8 +29,8 @@ With the Discord app installed and running:
 
 ```sh
 ./install.sh
-systemctl --user enable --now hr-rpc
-journalctl --user -u hr-rpc -f
+systemctl --user enable --now health-display
+journalctl --user -u health-display -f
 ```
 
 ## Configuration

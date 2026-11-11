@@ -1,8 +1,8 @@
 services:
-  discord-hr:
+  health-display:
     build: .
-    image: discord-hr:local
-    container_name: discord-hr
+    image: health-display:local
+    container_name: health-display
     restart: unless-stopped
     shm_size: 1gb
     environment:
@@ -13,6 +13,6 @@ services:
       - PASSWORD=${WEB_PASSWORD}
     volumes:
       - ./data:/config
-      - ./config.env:/config/.config/hr-rpc/config.env:ro
+      - ./config.env:/config/.config/health-display/config.env:ro
     ports:
       - "3011:3001"   # web desktop (https) — log in to Discord here once
