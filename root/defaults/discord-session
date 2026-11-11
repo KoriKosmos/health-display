@@ -1,0 +1,33 @@
+#!/bin/sh
+# Launched by the desktop session (autostart). Runs hr-rpc next to Discord and
+# relaunches Discord if it hangs on the "Starting..." splash or exits.
+mkdir -p "$HOME/.config/discord"
+# Discord refuses to start when the installed .deb is outdated; skip that check.
+python3 - <<'PY'
+import json, os
+p = os.path.expanduser("~/.config/discord/settings.json")
+try: s = json.load(open(p))
+except Exception: s = {}
+s["SKIP_HOST_UPDATE"] = True
+json.dump(s, open(p, "w"), indent=2)
+PY
+pkill -f /usr/local/bin/hr-rpc 2>/dev/null
+nohup /usr/local/bin/hr-rpc >> "$HOME/hr-rpc.log" 2>&1 &
+
+ipc="${XDG_RUNTIME_DIR:-/tmp}/discord-ipc-0"
+while true; do
+  pkill -f "$HOME/.config/discord/app-" 2>/dev/null; sleep 2
+  rm -f "$ipc" "$HOME/.config/discord/Singleton"*
+  discord --no-sandbox &
+  pid=$!
+  # The RPC socket only appears once the client has fully loaded.
+  i=0
+  while [ $i -lt 180 ] && kill -0 $pid 2>/dev/null && [ ! -S "$ipc" ]; do sleep 1; i=$((i+1)); done
+  if [ ! -S "$ipc" ]; then
+    echo "$(date +%T) discord-session: not ready after ${i}s, relaunching" >> "$HOME/hr-rpc.log"
+    continue
+  fi
+  wait $pid
+  echo "$(date +%T) discord-session: discord exited, relaunching" >> "$HOME/hr-rpc.log"
+  sleep 5
+done
