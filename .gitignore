@@ -1,0 +1,6 @@
+# Secrets
+config.env
+.env
+
+# Container profile data (Discord session, logs)
+data/
