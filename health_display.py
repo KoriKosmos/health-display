@@ -4,7 +4,7 @@
 Runs on the same Linux machine as the Discord desktop app. Python 3 stdlib only.
 Config: ~/.config/health-display/config.env (KEY=VALUE), overridable by environment vars.
 """
-import json, os, re, socket, struct, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+import hmac, json, os, re, socket, struct, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 
 CONFIG_PATH = os.path.expanduser(os.environ.get("HEALTH_DISPLAY_CONFIG", "~/.config/health-display/config.env"))
 
@@ -15,6 +15,7 @@ def load_config():
         "IMAGE": "on", "IMG_TEXT": "{bpm}", "IMG_HOVER": "{bpm} bpm", "IMG_BG": "ED4245", "IMG_FG": "FFFFFF",
         "POLL_INTERVAL": "3", "UPDATE_INTERVAL": "15", "STALE_AFTER": "60",
         "GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "", "GOOGLE_INTERVAL": "300",
+        "PUSH_TOKEN": "", "PUSH_URL": "", "PUSH_PORT": "8766", "PUSH_STALE_AFTER": "60",
         "STAT_MAX_AGE_DAYS": "1.5", "ROLLUP_SOURCES": "google-wearables",
         "SOURCE_DEFAULT": "watch,oura,ultrahuman,*,samsung,phone",
     }
@@ -479,6 +480,100 @@ class DiscordIPC:
             pass
         self.sock = None
 
+# ------------------------------------------------------------------ phone push (docs/server-push.md in health-display-android)
+PUSH_MAX_BODY = 64 * 1024
+
+class PhonePush:
+    """Receives value pushes from Health Display for Android on POST /push.
+
+    While the last valid push is younger than PUSH_STALE_AFTER (server clock), the
+    phone is "active" and its values replace the server's own Pulsoid/Google reads.
+    """
+    def __init__(self, token, port, stale):
+        self.token = token.encode(); self.port = port; self.stale = stale
+        self.lock = threading.Lock(); self.payload = None; self.received = 0; self.ip = None
+        self.rejected = set()
+
+    def reject(self, cause, ip):
+        with self.lock:
+            first = cause not in self.rejected; self.rejected.add(cause)
+        if first:
+            log(f"phone: rejected push from {ip}: {cause} (further '{cause}' rejections not logged)")
+
+    def accept(self, payload, ip):
+        with self.lock:
+            self.payload = payload; self.received = time.time(); self.ip = ip
+
+    def current(self):
+        """(payload, ip) of the latest push while the phone is active, else (None, None)."""
+        with self.lock:
+            if self.payload is not None and time.time() - self.received < self.stale:
+                return self.payload, self.ip
+        return None, None
+
+    @staticmethod
+    def validate(d):
+        if not isinstance(d, dict):
+            return None, "body is not a JSON object"
+        missing = [k for k in ("v", "sent_at", "live", "measured_at", "values") if k not in d]
+        if missing:
+            return None, f"missing fields: {', '.join(missing)}"
+        if d["v"] != 1:
+            return None, f"unsupported version v={d['v']!r}"
+        if not isinstance(d["live"], bool) or not isinstance(d["values"], dict):
+            return None, "bad field types"
+        return {**d, "values": {str(k): str(x) for k, x in d["values"].items() if x is not None}}, None
+
+    def start(self):
+        import http.server
+        push = self
+        class Handler(http.server.BaseHTTPRequestHandler):
+            server_version = "Health-Display"
+            def client_ip(self):
+                h = self.headers
+                return (h.get("CF-Connecting-IP") or (h.get("X-Forwarded-For") or "").split(",")[0].strip()
+                        or h.get("X-Real-IP") or self.client_address[0])
+            def reply(self, code):
+                self.send_response(code); self.send_header("Content-Length", "0")
+                if code == 405:
+                    self.send_header("Allow", "POST")
+                self.end_headers()
+            def route(self):
+                return urllib.parse.urlparse(self.path).path == "/push"
+            def do_POST(self):
+                ip = self.client_ip()
+                if not self.route():
+                    return self.reply(404)
+                auth = self.headers.get("Authorization", "")
+                given = auth[7:].strip().encode() if auth.startswith("Bearer ") else b""
+                if not hmac.compare_digest(given, push.token):
+                    push.reject("bad or missing token", ip); return self.reply(401)
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0 or length > PUSH_MAX_BODY:
+                    push.reject("body too large or bad Content-Length", ip); return self.reply(413 if length > 0 else 400)
+                try:
+                    data = json.loads(self.rfile.read(length) or b"null")
+                except ValueError:
+                    push.reject("body is not JSON", ip); return self.reply(400)
+                payload, err = PhonePush.validate(data)
+                if err:
+                    push.reject(err, ip); return self.reply(400)
+                push.accept(payload, ip); self.reply(204)
+            def other(self):
+                self.reply(405 if self.route() else 404)
+            do_GET = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = other
+            def do_HEAD(self):
+                self.reply(405 if self.route() else 404)
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log(f"phone: listening for pushes on :{self.port}/push")
+
 # ------------------------------------------------------------------ main loop
 def tile_url(bpm):
     text = urllib.parse.quote(C["IMG_TEXT"].replace("{bpm}", str(bpm)))
@@ -494,17 +589,23 @@ def render(tpl, values):
     text = " · ".join(x for x in out if x.strip())
     return text[:128] if len(text) >= 2 else ""
 
-def build_activity(hr, stats, started):
-    if not hr.live:
-        return None
-    values = {**(stats.values if stats else {}), **hr.values()}
+def build_activity(hr, stats, started, phone=None):
+    """Presence from the phone's latest push while it's active, else from our own sources."""
+    if phone is not None:
+        if not phone["live"]:
+            return None
+        values = phone["values"]; bpm = values.get("bpm")
+    else:
+        if not hr.live:
+            return None
+        values = {**(stats.values if stats else {}), **hr.values()}; bpm = hr.bpm
     a = {"type": 0, "timestamps": {"start": int(started)}}
     if (details := render(C["DETAILS"], values)):
         a["details"] = details
     if (state := render(C["STATE"], values)):
         a["state"] = state
-    if C["IMAGE"].lower() != "off":
-        a["assets"] = {"large_image": tile_url(hr.bpm)}
+    if C["IMAGE"].lower() != "off" and bpm:
+        a["assets"] = {"large_image": tile_url(bpm)}
         if (hover := render(C["IMG_HOVER"], values)):
             a["assets"]["large_text"] = hover
     return a
@@ -514,13 +615,19 @@ def main():
         sys.exit(f"Set PULSOID_TOKEN and DISCORD_APP_ID in {CONFIG_PATH}")
     hr = HeartRate(); ipc = DiscordIPC(C["DISCORD_APP_ID"]); stats = None
     if GoogleHealth.configured() and os.path.exists(GOOGLE_TOKEN_PATH):
-        import threading
         stats = HealthStats(); threading.Thread(target=stats.run_forever, daemon=True).start()
     elif GoogleHealth.configured():
         log(f"google: not signed in ({GOOGLE_TOKEN_PATH} missing); run: health-display auth")
-    started = time.time(); last_key = "init"; last_push = 0; next_poll = 0; warned = False
+    push = None
+    if C["PUSH_TOKEN"]:
+        push = PhonePush(C["PUSH_TOKEN"], int(C["PUSH_PORT"]), float(C["PUSH_STALE_AFTER"])); push.start()
+    started = time.time(); last_key = "init"; last_push = 0; next_poll = 0; warned = False; phone_active = False
     while True:
         now = time.time()
+        phone, phone_ip = push.current() if push else (None, None)
+        if (phone is not None) != phone_active:
+            phone_active = phone is not None
+            log(f"phone: active (pushes from {phone_ip})" if phone_active else "phone: inactive, using own sources")
         if now >= next_poll:
             next_poll = now + POLL
             try:
@@ -533,12 +640,12 @@ def main():
                     log("discord: desktop app not found, retrying every 15s"); warned = True
                 time.sleep(15); continue
             warned = False; last_key = "init"
-        act = build_activity(hr, stats, started)
+        act = build_activity(hr, stats, started, phone)
         key = json.dumps({k: v for k, v in (act or {}).items() if k != "timestamps"}, sort_keys=True)
         if key != last_key and (now - last_push >= UPDATE or last_key == "init" or act is None):
             try:
                 ipc.set_activity(act)
-                log(f"presence: {act.get('details', '')} | {act.get('state', '')}" if act else "presence: cleared (no HR data)")
+                log(f"presence: {act.get('details', '')} | {act.get('state', '')}" if act else f"presence: cleared ({'phone not live' if phone_active else 'no HR data'})")
                 last_key = key; last_push = now
             except (OSError, ConnectionError) as e:
                 log(f"discord: {e}"); ipc.close(); continue
