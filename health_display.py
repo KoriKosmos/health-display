@@ -814,12 +814,10 @@ def render(tpl, values):
     return text[:128] if len(text) >= 2 else ""
 
 def build_activity(hr, stats, started, phone=None):
-    """Presence from the phone's latest push while it's active, else from our own sources."""
-    if phone is not None:
-        if not phone["live"]:
-            return None
+    """Presence from the phone's latest push while it's active and live, else from our own sources."""
+    if phone is not None and phone["live"]:
         values = phone["values"]; bpm = values.get("bpm")
-    elif hr.live:
+    elif hr.live:  # also when the phone isn't live: our own sources (incl. ring fallback) may still have data
         values = {**(stats.values if stats else {}), **hr.values()}; bpm = hr.bpm
     elif stats and (fb := stats.fallback_hr()):  # no live HR: recent reading from any device, marked as such
         bpm = f"~{fb[0]}"; mins = round(fb[1] / 60)
@@ -876,7 +874,7 @@ def main():
         if key != last_key and (now - last_push >= UPDATE or last_key == "init" or act is None):
             try:
                 ipc.set_activity(act)
-                log(f"presence: {act.get('details', '')} | {act.get('state', '')}" if act else f"presence: cleared ({'phone not live' if phone_active else 'no HR data'})")
+                log(f"presence: {act.get('details', '')} | {act.get('state', '')}" if act else "presence: cleared (no HR data)")
                 last_key = key; last_push = now
             except (OSError, ConnectionError) as e:
                 log(f"discord: {e}"); ipc.close(); continue
