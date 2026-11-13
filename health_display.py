@@ -4,7 +4,7 @@
 Runs on the same Linux machine as the Discord desktop app. Python 3 stdlib only.
 Config: ~/.config/health-display/config.env (KEY=VALUE), overridable by environment vars.
 """
-import hmac, json, os, re, socket, struct, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import calendar, hmac, json, os, re, socket, struct, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 
 CONFIG_PATH = os.path.expanduser(os.environ.get("HEALTH_DISPLAY_CONFIG", "~/.config/health-display/config.env"))
 
@@ -15,6 +15,7 @@ def load_config():
         "IMAGE": "on", "IMG_TEXT": "{bpm}", "IMG_HOVER": "{bpm} bpm", "IMG_BG": "ED4245", "IMG_FG": "FFFFFF",
         "POLL_INTERVAL": "3", "UPDATE_INTERVAL": "15", "STALE_AFTER": "60",
         "GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "", "GOOGLE_INTERVAL": "300",
+        "HR_FALLBACK_MAX_AGE": "900", "HR_FALLBACK_INTERVAL": "60",
         "PUSH_TOKEN": "", "PUSH_URL": "", "PUSH_PORT": "8766", "PUSH_STALE_AFTER": "60",
         "STAT_MAX_AGE_DAYS": "1.5", "ROLLUP_SOURCES": "google-wearables",
         "SOURCE_DEFAULT": "watch,oura,ultrahuman,*,samsung,phone",
@@ -375,6 +376,29 @@ class HealthStats:
         self.values = v
         log("google: " + (", ".join(f"{k}={x}" for k, x in sorted(v.items())) or "no stats"))
 
+    def refresh_hr(self):
+        """Newest heart-rate sample from any device (watch, rings...) within HR_FALLBACK_MAX_AGE."""
+        max_age = float(C["HR_FALLBACK_MAX_AGE"])
+        pts = self.list("heart-rate", f'heart_rate.sample_time.physical_time >= "{self.since(max_age / 86400)}"')
+        when = lambda p: calendar.timegm(time.strptime(p["heartRate"]["sampleTime"]["physicalTime"][:19], "%Y-%m-%dT%H:%M:%S"))
+        p = self.best(pts, "HR", when, window=60)
+        self.recent_hr = (int(p["heartRate"]["beatsPerMinute"]), when(p), source_name(p.get("dataSource", {}))) if p else None
+
+    def run_hr_forever(self):
+        while True:
+            try:
+                self.refresh_hr()
+            except Exception as e:
+                log(f"google: heart rate: {e}")
+            time.sleep(float(C["HR_FALLBACK_INTERVAL"]))
+
+    def fallback_hr(self):
+        """(bpm, age_seconds, source) of a recent non-live reading, or None."""
+        r = getattr(self, "recent_hr", None)
+        if r and time.time() - r[1] <= float(C["HR_FALLBACK_MAX_AGE"]):
+            return r[0], max(0, time.time() - r[1]), r[2]
+        return None
+
     def run_forever(self):
         while True:
             try:
@@ -595,10 +619,14 @@ def build_activity(hr, stats, started, phone=None):
         if not phone["live"]:
             return None
         values = phone["values"]; bpm = values.get("bpm")
-    else:
-        if not hr.live:
-            return None
+    elif hr.live:
         values = {**(stats.values if stats else {}), **hr.values()}; bpm = hr.bpm
+    elif stats and (fb := stats.fallback_hr()):  # no live HR: recent reading from any device, marked as such
+        bpm = f"~{fb[0]}"; mins = round(fb[1] / 60)
+        values = {**stats.values, **hr.values(), "bpm": bpm, "bpm_src": fb[2],
+                  "bpm_age": "just now" if mins < 1 else f"{mins} min ago"}
+    else:
+        return None
     a = {"type": 0, "timestamps": {"start": int(started)}}
     if (details := render(C["DETAILS"], values)):
         a["details"] = details
@@ -616,6 +644,8 @@ def main():
     hr = HeartRate(); ipc = DiscordIPC(C["DISCORD_APP_ID"]); stats = None
     if GoogleHealth.configured() and os.path.exists(GOOGLE_TOKEN_PATH):
         stats = HealthStats(); threading.Thread(target=stats.run_forever, daemon=True).start()
+        if float(C["HR_FALLBACK_MAX_AGE"]) > 0:
+            threading.Thread(target=stats.run_hr_forever, daemon=True).start()
     elif GoogleHealth.configured():
         log(f"google: not signed in ({GOOGLE_TOKEN_PATH} missing); run: health-display auth")
     push = None
