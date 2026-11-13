@@ -35,16 +35,20 @@ while true; do
   rm -f "$ipc" "$HOME/.config/discord/Singleton"*
   discord --no-sandbox &
   pid=$!
-  # The RPC socket only appears once the client has fully loaded.
+  # The RPC socket only appears once the client has fully loaded. The updater may
+  # restart Discord under a new pid, so follow any Discord process, not just $pid.
+  alive() { kill -0 $pid 2>/dev/null || pgrep -f "$HOME/.config/discord/app-" >/dev/null; }
   i=0
-  while [ $i -lt 180 ] && kill -0 $pid 2>/dev/null && [ ! -S "$ipc" ]; do sleep 1; i=$((i+1)); done
+  while [ $i -lt 180 ] && alive && [ ! -S "$ipc" ]; do sleep 1; i=$((i+1)); done
   if [ ! -S "$ipc" ]; then
     echo "$(date +%T) discord-session: not ready after ${i}s, relaunching" >> "$HOME/health-display.log"
-    fails=$((fails+1))
+    # Only a hang counts towards clearing storage; a quick exit is just a restart.
+    [ $i -ge 180 ] && fails=$((fails+1))
     continue
   fi
   fails=0
-  wait $pid
+  # Wait for whichever Discord process is running now.
+  while alive; do sleep 5; done
   echo "$(date +%T) discord-session: discord exited, relaunching" >> "$HOME/health-display.log"
   sleep 5
 done
