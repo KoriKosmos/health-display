@@ -16,10 +16,11 @@ pkill -f /usr/local/bin/health-display 2>/dev/null
 nohup /usr/local/bin/health-display >> "$HOME/health-display.log" 2>&1 &
 
 ipc="${XDG_RUNTIME_DIR:-/tmp}/discord-ipc-0"
-fails=0
+# Container (re)starts tend to leave Discord's web storage damaged, so start clean.
+fails=startup
 while true; do
   pkill -f "$HOME/.config/discord/app-" 2>/dev/null; sleep 2
-  if [ $fails -ge 2 ]; then
+  if [ "$fails" = startup ] || [ "$fails" -ge 2 ]; then
     # Discord's stored web data gets damaged when it's killed mid-write (e.g. a container
     # restart), and then its renderer crashes on every start. Clear that data; the login
     # (Local Storage, Cookies, Local State, Preferences) is kept.
@@ -29,7 +30,8 @@ while true; do
            "$d/DawnGraphiteCache" "$d/DawnWebGPUCache" "$d/DIPS" "$d/DIPS-wal" "$d/VideoDecodeStats" \
            "$d/shared_proto_db" "$d/Network Persistent State" "$d/TransportSecurity" \
            "$d/Trust Tokens" "$d/Trust Tokens-journal" "$d/sentry"
-    echo "$(date +%T) discord-session: $fails failed starts, cleared Discord's web storage (login kept)" >> "$HOME/health-display.log"
+    reason="$fails failed starts"; [ "$fails" = startup ] && reason="container start"
+    echo "$(date +%T) discord-session: $reason, cleared Discord's web storage (login kept)" >> "$HOME/health-display.log"
     fails=0
   fi
   rm -f "$ipc" "$HOME/.config/discord/Singleton"*
