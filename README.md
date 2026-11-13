@@ -29,6 +29,31 @@ Fitbit, plus anything other apps (Oura, Ultrahuman, …) write to Health Connect
 In Testing mode Google expires the sign-in after 7 days; re-run `auth` then.
 Placeholders and per-stat source selection are documented in `config.env.example`.
 
+### Phone push (optional)
+
+When [Health Display for Android](https://github.com/KoriKosmos/health-display-android)
+is running, it can push its values here so the server's presence shows exactly
+what the phone shows. When the pushes stop for `PUSH_STALE_AFTER` seconds (60),
+the server falls back to its own Pulsoid/Google reads.
+
+1. Generate a shared secret: `openssl rand -hex 32`.
+2. In `config.env` set `PUSH_TOKEN` to it and `PUSH_URL` to the public address of
+   the server's `/push` endpoint (e.g. `https://health.example.com/push`, reverse
+   proxied to port `PUSH_PORT`, default 8766). Optional: `PUSH_PORT`,
+   `PUSH_STALE_AFTER`.
+3. Import the same `config.env` on the phone; `PUSH_URL` is only used there.
+
+The server listens on `POST /push` only while `PUSH_TOKEN` is set. Test it with:
+
+```sh
+curl -i -X POST https://health.example.com/push \
+  -H "Authorization: Bearer $PUSH_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"v":1,"sent_at":0,"live":true,"measured_at":0,"values":{"bpm":"77","steps":"1,234"}}'
+```
+
+It should return `204`. The protocol is specified in the Android repo's
+[`docs/server-push.md`](https://github.com/KoriKosmos/health-display-android/blob/main/docs/server-push.md).
+
 ## Run in a container (headless server)
 
 Runs the official Discord desktop client in a browser-accessible desktop
