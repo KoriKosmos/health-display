@@ -152,7 +152,8 @@ class GoogleHealth:
 
 # ------------------------------------------------------------------ Oura API v2
 OURA_API = "https://api.ouraring.com/v2/usercollection"
-OURA_TOKEN_URL = "https://api.ouraring.com/oauth/token"
+# Oura moved OAuth to moi.ouraring.com; the documented api.ouraring.com/oauth/token rejects its codes.
+OURA_TOKEN_URL = "https://moi.ouraring.com/oauth/v2/ext/oauth-token"
 OURA_SCOPES = ["personal", "daily", "heartrate", "workout", "session", "spo2", "heart_health"]
 OURA_TOKEN_PATH = os.path.expanduser(os.environ.get(
     "HEALTH_DISPLAY_OURA_TOKEN", "~/.local/state/health-display/oura-token.json"))
