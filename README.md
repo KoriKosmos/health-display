@@ -21,13 +21,27 @@ Fitbit, plus anything other apps (Oura, Ultrahuman, …) write to Health Connect
    `googlehealth.*.readonly` scopes) and create an OAuth client of type
    **Web application** with redirect URI `http://localhost:8765/`.
 2. Put `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `config.env`.
-3. Run `health-display auth`, open the printed URL and approve. If the browser
+3. Run `health-display auth google`, open the printed URL and approve. If the browser
    isn't on the same machine, the redirect page fails to load — paste its full
    address back into the prompt (or pass it as an argument).
 4. `health-display stats` prints the values it can show.
 
 In Testing mode Google expires the sign-in after 7 days; re-run `auth` then.
 Placeholders and per-stat source selection are documented in `config.env.example`.
+
+### Oura and Ultrahuman (optional)
+
+Health Connect only carries the rings' raw data. Their APIs add sleep score,
+readiness, stress and resilience (Oura) and Recovery / Movement Index
+(Ultrahuman), and fresher ring heart rate for the HR fallback. They join the
+same source merge as everything else.
+
+- **Ultrahuman:** create a personal token at https://vision.ultrahuman.com/developer
+  and set `ULTRAHUMAN_TOKEN`.
+- **Oura:** create an app at https://cloud.ouraring.com/oauth/applications with
+  redirect URI `http://localhost:8765/`, set `OURA_CLIENT_ID` and
+  `OURA_CLIENT_SECRET`, then run `health-display auth oura` (same paste-the-URL
+  flow as Google). Requires an active Oura membership.
 
 ### Phone push (optional)
 
