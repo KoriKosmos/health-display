@@ -154,7 +154,7 @@ class GoogleHealth:
 OURA_API = "https://api.ouraring.com/v2/usercollection"
 # Oura moved OAuth to moi.ouraring.com; the documented api.ouraring.com/oauth/token rejects its codes.
 OURA_TOKEN_URL = "https://moi.ouraring.com/oauth/v2/ext/oauth-token"
-OURA_SCOPES = ["personal", "daily", "heartrate", "workout", "session", "spo2", "heart_health"]
+OURA_SCOPES = ["personal", "daily", "heartrate", "workout", "session", "spo2", "heart_health", "stress"]
 OURA_TOKEN_PATH = os.path.expanduser(os.environ.get(
     "HEALTH_DISPLAY_OURA_TOKEN", "~/.local/state/health-display/oura-token.json"))
 
@@ -474,9 +474,15 @@ class HealthStats:
 
         # --- Oura API
         def oura():
+            def og(collection, **params):  # one collection failing (e.g. a missing scope) mustn't drop the rest
+                try:
+                    return self.oura.get(collection, **params)
+                except RuntimeError as e:
+                    log(f"stats: oura {collection}: {e}")
+                    return []
             q = {"start_date": recent_days[-1], "end_date": time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400))}
-            scores = {d["day"]: d.get("score") for d in self.oura.get("daily_sleep", **q)}
-            for d in self.oura.get("sleep", **q):
+            scores = {d["day"]: d.get("score") for d in og("daily_sleep", **q)}
+            for d in og("sleep", **q):
                 if d.get("type") != "long_sleep" or not fresh_day(d["day"]):
                     continue
                 mins = lambda k: hm(d[k] / 60) if d.get(k) else None
@@ -488,30 +494,30 @@ class HealthStats:
                 w = day_epoch(d["day"])
                 if d.get("lowest_heart_rate"): offer("RHR", "latest", {"rhr": d["lowest_heart_rate"], "rhr_src": "oura"}, "oura", when=w)
                 if d.get("average_hrv"): offer("HRV", "latest", {"hrv": d["average_hrv"], "hrv_src": "oura"}, "oura", when=w)
-            for d in self.oura.get("daily_readiness", **q):
+            for d in og("daily_readiness", **q):
                 if fresh_day(d["day"]):
                     offer("READINESS", "latest", {"readiness": d.get("score")}, "oura", when=day_epoch(d["day"]))
                     if d.get("temperature_deviation") is not None:
                         offer("TEMP", "latest", {"temp_delta": f"{d['temperature_deviation']:+.1f}"}, "oura", when=day_epoch(d["day"]))
-            for d in self.oura.get("daily_stress", **q):
+            for d in og("daily_stress", **q):
                 if fresh_day(d["day"]):
                     offer("STRESS", "latest", {
                         "stress": (d.get("day_summary") or "").title() or None,
                         "stress_high": hm(d["stress_high"] / 60) if d.get("stress_high") is not None else None,
                         "recovery_high": hm(d["recovery_high"] / 60) if d.get("recovery_high") is not None else None},
                         "oura", when=day_epoch(d["day"]))
-            for d in self.oura.get("daily_resilience", **q):
+            for d in og("daily_resilience", **q):
                 if fresh_day(d["day"]):
                     offer("RESILIENCE", "latest", {"resilience": (d.get("level") or "").title() or None}, "oura", when=day_epoch(d["day"]))
-            for d in self.oura.get("daily_activity", **q):
+            for d in og("daily_activity", **q):
                 if d["day"] == today:
                     if d.get("steps"): offer("STEPS", "total", {"steps": f"{d['steps']:,}", "steps_src": "oura"}, "oura", amount=d["steps"])
                     if d.get("active_calories"): offer("CALORIES", "total", {"active_kcal": f"{d['active_calories']:,}"}, "oura", amount=d["active_calories"])
                     offer("ACTIVITY_SCORE", "latest", {"activity_score": d.get("score")}, "oura", when=day_epoch(today))
-            for d in self.oura.get("daily_spo2", **q):
+            for d in og("daily_spo2", **q):
                 if fresh_day(d["day"]) and (x := (d.get("spo2_percentage") or {}).get("average")):
                     offer("SPO2", "latest", {"spo2": f"{x:.0f}"}, "oura", when=day_epoch(d["day"]))
-            for d in self.oura.get("vO2_max", start_date=time.strftime("%Y-%m-%d", time.localtime(time.time() - 30 * 86400)), end_date=q["end_date"]):
+            for d in og("vO2_max", start_date=time.strftime("%Y-%m-%d", time.localtime(time.time() - 30 * 86400)), end_date=q["end_date"]):
                 if d.get("vo2_max"):
                     offer("VO2", "latest", {"vo2max": f"{d['vo2_max']:.0f}"}, "oura", when=day_epoch(d["day"]))
         if self.oura and os.path.exists(OURA_TOKEN_PATH):
