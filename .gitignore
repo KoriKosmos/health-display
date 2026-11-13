@@ -4,3 +4,6 @@ config.env
 
 # Container profile data (Discord session, logs)
 data/
+
+# Python bytecode
+__pycache__/
