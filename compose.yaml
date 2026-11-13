@@ -16,3 +16,4 @@ services:
       - ./config.env:/config/.config/health-display/config.env:ro
     ports:
       - "3011:3001"   # web desktop (https) — log in to Discord here once
+      - "8766:8766"   # phone push endpoint (POST /push), see config.env.example
