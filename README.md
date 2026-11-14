@@ -80,7 +80,7 @@ curl -H "Authorization: Bearer $STATUS_TOKEN" http://<host>:8766/status
 ```json
 {"v": 1, "updated_at": 1794618705794, "mode": "live",
  "bpm": 72, "bpm_text": "72", "bpm_age_s": 2, "bpm_src": "pulsoid",
- "presence": {"details": "❤️ 72 bpm · RHR 63", "state": "👟 330", "hover": "…"},
+ "presence": {"details": "❤️ 72 bpm · RHR 63", "state": "👟 330", "hover": "…", "badge": "…"},
  "values": {"bpm": "72", "rhr": "63", "steps": "330", "sleep_score": "88", "…": "…"}}
 ```
 

@@ -854,7 +854,8 @@ def set_status(mode, values, bpm_text=None, age=None, src=None, act=None):
     presence = None
     if act:
         presence = {"details": act.get("details"), "state": act.get("state"),
-                    "hover": (act.get("assets") or {}).get("large_text")}
+                    "hover": (act.get("assets") or {}).get("large_text"),
+                    "badge": (act.get("assets") or {}).get("small_text")}
     with STATUS_LOCK:
         STATUS.update({"updated_at": int(time.time() * 1000), "mode": mode, "bpm": bpm,
                        "bpm_text": str(bpm_text) if bpm_text else None, "bpm_age_s": age, "bpm_src": src,
