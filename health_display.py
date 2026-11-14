@@ -12,7 +12,9 @@ def load_config():
     cfg = {
         "PULSOID_TOKEN": "", "DISCORD_APP_ID": "",
         "DETAILS": "❤️ {bpm} bpm", "STATE": "min {min} · avg {avg} · max {max}",
-        "IMAGE": "on", "IMG_TEXT": "{bpm}", "IMG_HOVER": "{bpm} bpm", "IMG_BG": "ED4245", "IMG_FG": "FFFFFF",
+        "IMAGE": "on", "IMG_TEXT": "{bpm}", "IMG_TEXT_ALT": "", "IMG_ROTATE": "30",
+        "IMG_HOVER": "{bpm} bpm", "IMG_BG": "ED4245", "IMG_FG": "FFFFFF",
+        "SMALL_IMG_TEXT": "", "SMALL_TEXT": "", "SMALL_BG": "5865F2", "SMALL_FG": "FFFFFF",
         "POLL_INTERVAL": "3", "UPDATE_INTERVAL": "15", "STALE_AFTER": "60",
         "GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "", "GOOGLE_INTERVAL": "300",
         "HR_FALLBACK_MAX_AGE": "900", "HR_FALLBACK_INTERVAL": "60",
@@ -817,9 +819,17 @@ class PhonePush:
             + (" GET /status" if C["STATUS_TOKEN"] else ""))
 
 # ------------------------------------------------------------------ main loop
-def tile_url(bpm):
-    text = urllib.parse.quote(C["IMG_TEXT"].replace("{bpm}", str(bpm)))
-    return f"https://placehold.co/512x512/{C['IMG_BG']}/{C['IMG_FG']}/png?text={text}&font=montserrat"
+def tile_url(text, bg, fg, size=512):
+    """Generated square image with `text` ('\\n' in templates = line break)."""
+    return (f"https://placehold.co/{size}x{size}/{bg}/{fg}/png?"
+            f"text={urllib.parse.quote(text.replace(chr(10), chr(92) + 'n'))}&font=montserrat")
+
+def render_first(tpl, values):
+    """First of the '||'-separated alternatives that renders to something."""
+    for alt in tpl.split("||"):
+        if (text := render(alt.strip(), values)):
+            return text
+    return ""
 
 def render(tpl, values):
     """Fill {placeholders}; drop any ' · '-separated segment that references a missing value."""
@@ -882,9 +892,19 @@ def build_activity(hr, stats, started, phone=None):
     if (state := render(C["STATE"], values)):
         a["state"] = state
     if C["IMAGE"].lower() != "off" and bpm:
-        a["assets"] = {"large_image": tile_url(bpm)}
+        # Big tile: IMG_TEXT, rotating with the IMG_TEXT_ALT alternatives every IMG_ROTATE seconds.
+        texts = [t for t in (render(C["IMG_TEXT"], values),
+                             *(render(x.strip(), values) for x in C["IMG_TEXT_ALT"].split("||") if x.strip())) if t]
+        rotate = float(C["IMG_ROTATE"] or 0)
+        text = texts[int(time.time() // rotate) % len(texts)] if texts and rotate > 0 else (texts or [str(bpm)])[0]
+        a["assets"] = {"large_image": tile_url(text.replace("\\n", "\n"), C["IMG_BG"], C["IMG_FG"])}
         if (hover := render(C["IMG_HOVER"], values)):
             a["assets"]["large_text"] = hover
+        # Small badge on the tile, with its own hover text; hidden while it has nothing to show.
+        if (badge := render_first(C["SMALL_IMG_TEXT"], values)):
+            a["assets"]["small_image"] = tile_url(badge.replace("\\n", "\n"), C["SMALL_BG"], C["SMALL_FG"], 256)
+            if (small := render(C["SMALL_TEXT"], values)):
+                a["assets"]["small_text"] = small
     set_status(mode, values, bpm, round(age) if age is not None else None, src, a)
     return a
 
