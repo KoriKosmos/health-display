@@ -816,7 +816,8 @@ def render(tpl, values):
 def build_activity(hr, stats, started, phone=None):
     """Presence from the phone's latest push while it's active and live, else from our own sources."""
     if phone is not None and phone["live"]:
-        values = phone["values"]; bpm = values.get("bpm")
+        # The phone's values win; our own fill gaps it can't provide (e.g. Oura/Ultrahuman scores).
+        values = {**(stats.values if stats else {}), **phone["values"]}; bpm = phone["values"].get("bpm")
     elif hr.live:  # also when the phone isn't live: our own sources (incl. ring fallback) may still have data
         values = {**(stats.values if stats else {}), **hr.values()}; bpm = hr.bpm
     elif stats and (fb := stats.fallback_hr()):  # no live HR: recent reading from any device, marked as such
