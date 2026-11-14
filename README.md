@@ -68,6 +68,27 @@ curl -i -X POST https://health.example.com/push \
 It should return `204`. The protocol is specified in the Android repo's
 [`docs/server-push.md`](https://github.com/KoriKosmos/health-display-android/blob/main/docs/server-push.md).
 
+### Status API (optional)
+
+Set `STATUS_TOKEN` and the server answers `GET /status` on `PUSH_PORT` with a
+JSON snapshot of the current state, for a website or other dashboards:
+
+```sh
+curl -H "Authorization: Bearer $STATUS_TOKEN" http://<host>:8766/status
+```
+
+```json
+{"v": 1, "updated_at": 1794618705794, "mode": "live",
+ "bpm": 72, "bpm_text": "72", "bpm_age_s": 2, "bpm_src": "pulsoid",
+ "presence": {"details": "❤️ 72 bpm · RHR 63", "state": "👟 330", "hover": "…"},
+ "values": {"bpm": "72", "rhr": "63", "steps": "330", "sleep_score": "88", "…": "…"}}
+```
+
+`mode` is `phone` (a live phone push), `live` (Pulsoid), `recent` (the HR
+fallback, `bpm_text` is `~72`), or `offline` (no heart rate; `values` still has
+the day's stats and `presence` is null). `values` are display strings, keyed by
+the same placeholder names as the templates.
+
 ## Run in a container (headless server)
 
 Runs the official Discord desktop client in a browser-accessible desktop

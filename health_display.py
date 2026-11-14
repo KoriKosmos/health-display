@@ -16,6 +16,7 @@ def load_config():
         "POLL_INTERVAL": "3", "UPDATE_INTERVAL": "15", "STALE_AFTER": "60",
         "GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "", "GOOGLE_INTERVAL": "300",
         "HR_FALLBACK_MAX_AGE": "900", "HR_FALLBACK_INTERVAL": "60",
+        "STATUS_TOKEN": "",
         "PUSH_TOKEN": "", "PUSH_URL": "", "PUSH_PORT": "8766", "PUSH_STALE_AFTER": "60",
         "STAT_MAX_AGE_DAYS": "1.5", "ROLLUP_SOURCES": "google-wearables",
         "SOURCE_DEFAULT": "watch,oura,ultrahuman,*,samsung,phone",
@@ -760,12 +761,16 @@ class PhonePush:
             def reply(self, code):
                 self.send_response(code); self.send_header("Content-Length", "0")
                 if code == 405:
-                    self.send_header("Allow", "POST")
+                    self.send_header("Allow", "GET" if self.is_status() else "POST")
                 self.end_headers()
             def route(self):
-                return urllib.parse.urlparse(self.path).path == "/push"
+                return urllib.parse.urlparse(self.path).path == "/push" and bool(push.token)
+            def is_status(self):
+                return urllib.parse.urlparse(self.path).path == "/status" and bool(C["STATUS_TOKEN"])
             def do_POST(self):
                 ip = self.client_ip()
+                if self.is_status():
+                    return self.reply(405)
                 if not self.route():
                     return self.reply(404)
                 auth = self.headers.get("Authorization", "")
@@ -786,17 +791,30 @@ class PhonePush:
                 if err:
                     push.reject(err, ip); return self.reply(400)
                 push.accept(payload, ip); self.reply(204)
+            def do_GET(self):
+                if not self.is_status():
+                    return self.other()
+                auth = self.headers.get("Authorization", "")
+                given = auth[7:].strip().encode() if auth.startswith("Bearer ") else b""
+                if not hmac.compare_digest(given, C["STATUS_TOKEN"].encode()):
+                    push.reject("status: bad or missing token", self.client_ip()); return self.reply(401)
+                with STATUS_LOCK:
+                    body = json.dumps(STATUS, ensure_ascii=False).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
             def other(self):
-                self.reply(405 if self.route() else 404)
-            do_GET = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = other
+                self.reply(405 if self.route() or self.is_status() else 404)
+            do_PUT = do_DELETE = do_PATCH = do_OPTIONS = other
             def do_HEAD(self):
-                self.reply(405 if self.route() else 404)
+                self.other()
             def log_message(self, *a):
                 pass
         srv = http.server.ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
         srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        log(f"phone: listening for pushes on :{self.port}/push")
+        log(f"phone: listening on :{self.port}" + (" POST /push" if self.token else "")
+            + (" GET /status" if C["STATUS_TOKEN"] else ""))
 
 # ------------------------------------------------------------------ main loop
 def tile_url(bpm):
@@ -813,18 +831,42 @@ def render(tpl, values):
     text = " · ".join(x for x in out if x.strip())
     return text[:128] if len(text) >= 2 else ""
 
+STATUS_LOCK = threading.Lock()
+STATUS = {"v": 1, "updated_at": 0, "mode": "offline", "bpm": None, "bpm_text": None, "bpm_age_s": None,
+          "bpm_src": None, "presence": None, "values": {}}
+
+def set_status(mode, values, bpm_text=None, age=None, src=None, act=None):
+    """Snapshot for GET /status (what the presence shows, plus every value we have)."""
+    try:
+        bpm = int(str(bpm_text).lstrip("~")) if bpm_text else None
+    except ValueError:
+        bpm = None
+    presence = None
+    if act:
+        presence = {"details": act.get("details"), "state": act.get("state"),
+                    "hover": (act.get("assets") or {}).get("large_text")}
+    with STATUS_LOCK:
+        STATUS.update({"updated_at": int(time.time() * 1000), "mode": mode, "bpm": bpm,
+                       "bpm_text": str(bpm_text) if bpm_text else None, "bpm_age_s": age, "bpm_src": src,
+                       "presence": presence, "values": dict(values)})
+
 def build_activity(hr, stats, started, phone=None):
     """Presence from the phone's latest push while it's active and live, else from our own sources."""
+    own = dict(stats.values) if stats else {}
     if phone is not None and phone["live"]:
         # The phone's values win; our own fill gaps it can't provide (e.g. Oura/Ultrahuman scores).
-        values = {**(stats.values if stats else {}), **phone["values"]}; bpm = phone["values"].get("bpm")
+        values = {**own, **phone["values"]}; bpm = phone["values"].get("bpm")
+        mode, age, src = "phone", max(0, time.time() - phone["measured_at"] / 1000) if phone.get("measured_at") else None, values.get("bpm_src")
     elif hr.live:  # also when the phone isn't live: our own sources (incl. ring fallback) may still have data
-        values = {**(stats.values if stats else {}), **hr.values()}; bpm = hr.bpm
+        values = {**own, **hr.values()}; bpm = hr.bpm
+        mode, age, src = "live", max(0, time.time() - hr.measured), "pulsoid"
     elif stats and (fb := stats.fallback_hr()):  # no live HR: recent reading from any device, marked as such
         bpm = f"~{fb[0]}"; mins = round(fb[1] / 60)
-        values = {**stats.values, **hr.values(), "bpm": bpm, "bpm_src": fb[2],
+        values = {**own, **hr.values(), "bpm": bpm, "bpm_src": fb[2],
                   "bpm_age": "just now" if mins < 1 else f"{mins} min ago"}
+        mode, age, src = "recent", fb[1], fb[2]
     else:
+        set_status("offline", own)
         return None
     a = {"type": 0, "timestamps": {"start": int(started)}}
     if (details := render(C["DETAILS"], values)):
@@ -835,6 +877,7 @@ def build_activity(hr, stats, started, phone=None):
         a["assets"] = {"large_image": tile_url(bpm)}
         if (hover := render(C["IMG_HOVER"], values)):
             a["assets"]["large_text"] = hover
+    set_status(mode, values, bpm, round(age) if age is not None else None, src, a)
     return a
 
 def main():
@@ -849,7 +892,7 @@ def main():
     elif GoogleHealth.configured():
         log(f"google: not signed in ({GOOGLE_TOKEN_PATH} missing); run: health-display auth")
     push = None
-    if C["PUSH_TOKEN"]:
+    if C["PUSH_TOKEN"] or C["STATUS_TOKEN"]:
         push = PhonePush(C["PUSH_TOKEN"], int(C["PUSH_PORT"]), float(C["PUSH_STALE_AFTER"])); push.start()
     started = time.time(); last_key = "init"; last_push = 0; next_poll = 0; warned = False; phone_active = False
     while True:
