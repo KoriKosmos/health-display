@@ -18,7 +18,7 @@ def load_config():
         "POLL_INTERVAL": "3", "UPDATE_INTERVAL": "15", "STALE_AFTER": "60",
         "GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": "", "GOOGLE_INTERVAL": "300",
         "HR_FALLBACK_MAX_AGE": "900", "HR_FALLBACK_INTERVAL": "60",
-        "STATUS_TOKEN": "",
+        "STATUS_TOKEN": "", "SHOW_WITHOUT_HR": "on",
         "PUSH_TOKEN": "", "PUSH_URL": "", "PUSH_PORT": "8766", "PUSH_STALE_AFTER": "60",
         "STAT_MAX_AGE_DAYS": "1.5", "ROLLUP_SOURCES": "google-wearables",
         "SOURCE_DEFAULT": "watch,oura,ultrahuman,*,samsung,phone",
@@ -884,6 +884,8 @@ def build_activity(hr, stats, started, phone=None):
         values = {**own, **hr.values(), "bpm": bpm, "bpm_src": fb[2],
                   "bpm_age": "just now" if mins < 1 else f"{mins} min ago"}
         mode, age, src = "recent", fb[1], fb[2]
+    elif own and C["SHOW_WITHOUT_HR"].lower() != "off":  # no heart rate at all: still show the day's stats
+        values = own; bpm = None; mode, age, src = "offline", None, None
     else:
         set_status("offline", own)
         return None
@@ -892,12 +894,13 @@ def build_activity(hr, stats, started, phone=None):
         a["details"] = details
     if (state := render(C["STATE"], values)):
         a["state"] = state
-    if C["IMAGE"].lower() != "off" and bpm:
-        # Big tile: IMG_TEXT, rotating with the IMG_TEXT_ALT alternatives every IMG_ROTATE seconds.
-        texts = [t for t in (render(C["IMG_TEXT"], values),
-                             *(render(x.strip(), values) for x in C["IMG_TEXT_ALT"].split("||") if x.strip())) if t]
+    # Big tile: IMG_TEXT, rotating with the IMG_TEXT_ALT alternatives every IMG_ROTATE seconds
+    # (without a heart rate, only the alternatives that have data).
+    texts = [t for t in (render(C["IMG_TEXT"], values),
+                         *(render(x.strip(), values) for x in C["IMG_TEXT_ALT"].split("||") if x.strip())) if t]
+    if C["IMAGE"].lower() != "off" and texts:
         rotate = float(C["IMG_ROTATE"] or 0)
-        text = texts[int(time.time() // rotate) % len(texts)] if texts and rotate > 0 else (texts or [str(bpm)])[0]
+        text = texts[int(time.time() // rotate) % len(texts)] if rotate > 0 else texts[0]
         a["assets"] = {"large_image": tile_url(text.replace("\\n", "\n"), C["IMG_BG"], C["IMG_FG"])}
         if (hover := render(C["IMG_HOVER"], values)):
             a["assets"]["large_text"] = hover
@@ -947,7 +950,7 @@ def main():
         if key != last_key and (now - last_push >= UPDATE or last_key == "init" or act is None):
             try:
                 ipc.set_activity(act)
-                log(f"presence: {act.get('details', '')} | {act.get('state', '')}" if act else "presence: cleared (no HR data)")
+                log(f"presence: {act.get('details', '')} | {act.get('state', '')}" if act else "presence: cleared (no data)")
                 last_key = key; last_push = now
             except (OSError, ConnectionError) as e:
                 log(f"discord: {e}"); ipc.close(); continue
