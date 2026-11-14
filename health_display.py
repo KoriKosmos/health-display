@@ -851,8 +851,16 @@ def set_status(mode, values, bpm_text=None, age=None, src=None, act=None):
                        "presence": presence, "values": dict(values)})
 
 def build_activity(hr, stats, started, phone=None):
-    """Presence from the phone's latest push while it's active and live, else from our own sources."""
+    """Presence from the phone's latest push while it's active and live, else from our own sources.
+
+    The phone's stats always count while it's active: they win over our own values, and when the
+    phone has no live heart rate only its heart-rate keys are ignored."""
     own = dict(stats.values) if stats else {}
+    if phone is not None and not phone["live"]:
+        # A phone without live HR is still a data source (fresh Health Connect stats); its
+        # heart-rate keys are dropped so our own sources (Pulsoid, HR fallback) decide those.
+        own.update({k: x for k, x in phone["values"].items()
+                    if k not in ("bpm", "min", "avg", "max", "bpm_age", "bpm_src")})
     if phone is not None and phone["live"]:
         # The phone's values win; our own fill gaps it can't provide (e.g. Oura/Ultrahuman scores).
         values = {**own, **phone["values"]}; bpm = phone["values"].get("bpm")
